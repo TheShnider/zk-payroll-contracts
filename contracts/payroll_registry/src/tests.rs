@@ -2,8 +2,7 @@ use super::*;
 use soroban_sdk::testutils::{Address as _, Events};
 use soroban_sdk::{Env, IntoVal, String, Symbol, TryIntoVal};
 
-const VALID_EMPLOYEE_WALLET: &str =
-    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const VALID_EMPLOYEE_WALLET: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 const BAD_CHECKSUM_EMPLOYEE_WALLET: &str =
     "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHA";
 
@@ -387,6 +386,123 @@ fn test_reactivating_inactive_employee_restores_eligibility() {
 
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
     assert!(client.is_eligible(&company_id, &employee));
+}
+
+// ── Issue #723: verified beneficiary changes ─────────────────────────────────
+
+#[test]
+fn test_beneficiary_change_requires_both_parties_and_preserves_employee_state() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let current_beneficiary = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[8u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &current_beneficiary, &commitment);
+    client.set_employee_status(&company_id, &current_beneficiary, &EmployeeStatus::Inactive);
+    client.propose_beneficiary_change(&company_id, &current_beneficiary, &new_beneficiary);
+
+    let pending = client
+        .get_pending_beneficiary_change(&company_id, &current_beneficiary)
+        .expect("proposal should be available for verification");
+    assert_eq!(pending.new_beneficiary, new_beneficiary);
+    assert!(!client.is_eligible(&company_id, &current_beneficiary));
+
+    client.accept_beneficiary_change(&company_id, &current_beneficiary, &new_beneficiary);
+
+    assert!(client
+        .try_get_commitment(&company_id, &current_beneficiary)
+        .is_err());
+    assert_eq!(
+        client.get_commitment(&company_id, &new_beneficiary),
+        commitment
+    );
+    assert_eq!(
+        client.get_employee_status(&company_id, &new_beneficiary),
+        EmployeeStatus::Inactive
+    );
+    assert!(!client.is_eligible(&company_id, &new_beneficiary));
+    assert!(client
+        .get_pending_beneficiary_change(&company_id, &current_beneficiary)
+        .is_none());
+}
+
+#[test]
+fn test_beneficiary_change_rejects_acceptance_from_wrong_address() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let current_beneficiary = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[9u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &current_beneficiary, &commitment);
+    client.propose_beneficiary_change(&company_id, &current_beneficiary, &new_beneficiary);
+
+    let result = client.try_accept_beneficiary_change(&company_id, &current_beneficiary, &impostor);
+    assert!(result.is_err());
+    assert_eq!(
+        client.get_commitment(&company_id, &current_beneficiary),
+        commitment
+    );
+    assert!(client
+        .get_pending_beneficiary_change(&company_id, &current_beneficiary)
+        .is_some());
+}
+
+#[test]
+fn test_beneficiary_change_rejects_existing_destination() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let current_beneficiary = Address::generate(&env);
+    let existing_beneficiary = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[10u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &current_beneficiary, &commitment);
+    client.add_employee(&company_id, &existing_beneficiary, &commitment);
+
+    let result = client.try_propose_beneficiary_change(
+        &company_id,
+        &current_beneficiary,
+        &existing_beneficiary,
+    );
+    assert!(result.is_err());
+    assert!(client
+        .get_pending_beneficiary_change(&company_id, &current_beneficiary)
+        .is_none());
+}
+
+#[test]
+fn test_admin_can_cancel_pending_beneficiary_change() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let current_beneficiary = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[11u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &current_beneficiary, &commitment);
+    client.propose_beneficiary_change(&company_id, &current_beneficiary, &new_beneficiary);
+    client.cancel_beneficiary_change(&company_id, &current_beneficiary, &admin);
+
+    assert!(client
+        .get_pending_beneficiary_change(&company_id, &current_beneficiary)
+        .is_none());
+    assert_eq!(
+        client.get_commitment(&company_id, &current_beneficiary),
+        commitment
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -840,4 +956,3 @@ fn test_cancel_treasury_rotation_emits_event() {
     let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
     assert_eq!(comp_id, company_id);
 }
-

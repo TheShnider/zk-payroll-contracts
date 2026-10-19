@@ -54,6 +54,15 @@ pub struct PendingCompanyRotation {
     pub proposed_at: u64,
 }
 
+/// Pending employee beneficiary change requiring both company and recipient
+/// authorization before the registry moves the employee record.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingBeneficiaryChange {
+    pub new_beneficiary: Address,
+    pub proposed_at: u64,
+}
+
 /// Storage key space for the payroll registry.
 ///
 /// - `Company(u64)`               → `CompanyInfo`              (Persistent)
@@ -62,6 +71,7 @@ pub struct PendingCompanyRotation {
 /// - `CompanySequence`            → `u64`                      (Persistent, counter)
 /// - `PendingAdminRotation(u64)`  → `PendingCompanyRotation`   (Persistent, issue #91)
 /// - `PendingTreasuryRotation(u64)` → `PendingCompanyRotation` (Persistent, issue #91)
+/// - `PendingBeneficiaryChange(u64, Address)` → `PendingBeneficiaryChange` (Persistent, issue #723)
 #[contracttype]
 pub enum DataKey {
     Company(u64),
@@ -73,6 +83,8 @@ pub enum DataKey {
     PendingAdminRotation(u64),
     /// Pending treasury rotation for a company (issue #91).
     PendingTreasuryRotation(u64),
+    /// Pending, verified employee beneficiary change (issue #723).
+    PendingBeneficiaryChange(u64, Address),
     /// Per-admin company ID lookup (issue #152: reject duplicate company registration).
     CompanyAdmin(Address),
     /// Pause manager address (issue #167).
@@ -131,6 +143,39 @@ pub trait PayrollRegistryTrait {
 
     /// Return `true` iff the employee is registered AND has `Active` status.
     fn is_eligible(env: Env, company_id: u64, employee: Address) -> bool;
+
+    /// Propose changing an employee's beneficiary. Both the current beneficiary
+    /// and company admin must authorize; the new beneficiary must accept.
+    fn propose_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        new_beneficiary: Address,
+    );
+
+    /// Accept a pending beneficiary change by authorizing as the proposed
+    /// beneficiary. The existing commitment and eligibility status are kept.
+    fn accept_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        new_beneficiary: Address,
+    );
+
+    /// Cancel a pending beneficiary change. Requires company admin authorization.
+    fn cancel_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        admin: Address,
+    );
+
+    /// Read the pending beneficiary change for an employee, if present.
+    fn get_pending_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+    ) -> Option<PendingBeneficiaryChange>;
 
     // ── Issue #91: company-level admin/treasury rotation ─────────────────────
 
@@ -497,6 +542,177 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::EmpStatus(company_id, employee))
             .unwrap_or(EmployeeStatus::Incomplete);
         status == EmployeeStatus::Active
+    }
+
+    fn propose_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        new_beneficiary: Address,
+    ) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        if current_beneficiary == new_beneficiary {
+            panic!("New beneficiary must differ from current beneficiary");
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Employee(company_id, current_beneficiary.clone()))
+        {
+            panic!("Employee not found");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Employee(company_id, new_beneficiary.clone()))
+        {
+            panic!("New beneficiary is already registered");
+        }
+
+        let pending_key =
+            DataKey::PendingBeneficiaryChange(company_id, current_beneficiary.clone());
+        if env.storage().persistent().has(&pending_key) {
+            panic!("A beneficiary change is already pending for this employee");
+        }
+
+        current_beneficiary.require_auth();
+        info.admin.require_auth();
+
+        let proposal = PendingBeneficiaryChange {
+            new_beneficiary: new_beneficiary.clone(),
+            proposed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&pending_key, &proposal);
+        env.events().publish(
+            (
+                Symbol::new(&env, "BeneficiaryChangeProposed"),
+                company_id,
+                current_beneficiary,
+            ),
+            (new_beneficiary, env.ledger().timestamp()),
+        );
+    }
+
+    fn accept_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        new_beneficiary: Address,
+    ) {
+        Self::require_not_paused(&env);
+        let pending_key =
+            DataKey::PendingBeneficiaryChange(company_id, current_beneficiary.clone());
+        let proposal: PendingBeneficiaryChange = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .expect("No pending beneficiary change for this employee");
+
+        if new_beneficiary != proposal.new_beneficiary {
+            panic!("Unauthorized: caller is not the proposed beneficiary");
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Employee(company_id, current_beneficiary.clone()))
+        {
+            panic!("Employee not found");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Employee(company_id, new_beneficiary.clone()))
+        {
+            panic!("New beneficiary is already registered");
+        }
+        new_beneficiary.require_auth();
+
+        let old_key = DataKey::Employee(company_id, current_beneficiary.clone());
+        let commitment: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&old_key)
+            .expect("Employee not found");
+        let old_status: EmployeeStatus = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmpStatus(company_id, current_beneficiary.clone()))
+            .unwrap_or(EmployeeStatus::Incomplete);
+
+        env.storage().persistent().remove(&old_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EmpStatus(company_id, current_beneficiary.clone()));
+        env.storage().persistent().set(
+            &DataKey::Employee(company_id, new_beneficiary.clone()),
+            &commitment,
+        );
+        env.storage().persistent().set(
+            &DataKey::EmpStatus(company_id, new_beneficiary.clone()),
+            &old_status,
+        );
+        env.storage().persistent().remove(&pending_key);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "BeneficiaryChanged"),
+                company_id,
+                current_beneficiary,
+            ),
+            (new_beneficiary, env.ledger().timestamp()),
+        );
+    }
+
+    fn cancel_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+        admin: Address,
+    ) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        if admin != info.admin {
+            panic!("Unauthorized: caller is not the company admin");
+        }
+        admin.require_auth();
+
+        let pending_key =
+            DataKey::PendingBeneficiaryChange(company_id, current_beneficiary.clone());
+        if !env.storage().persistent().has(&pending_key) {
+            panic!("No pending beneficiary change for this employee");
+        }
+        env.storage().persistent().remove(&pending_key);
+        env.events().publish(
+            (
+                Symbol::new(&env, "BeneficiaryChangeCancelled"),
+                company_id,
+                current_beneficiary,
+            ),
+            (admin, env.ledger().timestamp()),
+        );
+    }
+
+    fn get_pending_beneficiary_change(
+        env: Env,
+        company_id: u64,
+        current_beneficiary: Address,
+    ) -> Option<PendingBeneficiaryChange> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingBeneficiaryChange(
+                company_id,
+                current_beneficiary,
+            ))
     }
 
     // ── Issue #91: company-level admin/treasury rotation ─────────────────────
