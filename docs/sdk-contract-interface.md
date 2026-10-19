@@ -327,6 +327,14 @@ Drafts let you correct totals before committing on-chain.
 | `run_id` | `u64` | Completed run ID |
 | `status` | `ReconciliationStatus` | `Reconciled`, `Unreconciled`, or `Failed` |
 
+For delayed transaction confirmation, call the read-only
+`Payroll::get_payout_confirmation_retry_decision(retries_used, last_attempt_at)`
+before checking the existing run's status again. It allows up to five
+confirmation retries with delays of 30, 60, 120, 240, and 480 seconds. This
+policy applies only to checking the existing run; never resubmit the payout.
+After the retry limit, stop automatic checks and escalate the run ID for
+operator review.
+
 #### Stale prepared runs: expiration (#474)
 
 A run prepared via `prepare_payroll_run` (or a two-step flow that leaves a run

@@ -10,6 +10,8 @@ use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
 const MAX_BATCH: u32 = 50;
+const PAYOUT_CONFIRMATION_MAX_RETRIES: u32 = 5;
+const PAYOUT_CONFIRMATION_BASE_DELAY_SECONDS: u64 = 30;
 
 #[contract]
 pub struct Payroll;
@@ -32,6 +34,24 @@ pub enum ReconciliationStatus {
     Unreconciled,
     Reconciled,
     Failed,
+}
+
+/// Retry guidance for checking whether an already-submitted payout settled.
+///
+/// This policy only schedules confirmation checks; it never resubmits a payout.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayoutConfirmationRetryDecision {
+    /// Number of confirmation retries already performed.
+    pub retries_used: u32,
+    /// Maximum confirmation retries after the original submission.
+    pub max_retries: u32,
+    /// Earliest timestamp for the next confirmation check, or `None` if exhausted.
+    pub retry_after: Option<u64>,
+    /// Whether a confirmation check is due at the current ledger timestamp.
+    pub retry_allowed: bool,
+    /// Whether the retry limit has been reached.
+    pub exhausted: bool,
 }
 
 /// Canonical payroll run state shared by contracts, SDKs, and dashboards (#159).
@@ -2192,6 +2212,44 @@ impl Payroll {
     /// Return the canonical state for a payroll run ID.
     pub fn get_payroll_run_state(e: Env, run_id: u64) -> PayrollRunState {
         Self::get_payroll_run_state_internal(&e, run_id)
+    }
+
+    /// Return the deterministic retry decision for checking payout confirmation.
+    ///
+    /// Clients pass the number of confirmation retries already made and the
+    /// timestamp of their last check. The policy allows five retries with
+    /// exponential delays of 30, 60, 120, 240, and 480 seconds. This endpoint
+    /// is read-only: integrations must check the existing run's status and must
+    /// not resubmit the payout when confirmation is delayed.
+    pub fn get_payout_confirmation_retry_decision(
+        e: Env,
+        retries_used: u32,
+        last_attempt_at: u64,
+    ) -> PayoutConfirmationRetryDecision {
+        let now = e.ledger().timestamp();
+        if last_attempt_at > now {
+            panic!("Last confirmation attempt timestamp is in the future");
+        }
+
+        if retries_used >= PAYOUT_CONFIRMATION_MAX_RETRIES {
+            return PayoutConfirmationRetryDecision {
+                retries_used,
+                max_retries: PAYOUT_CONFIRMATION_MAX_RETRIES,
+                retry_after: None,
+                retry_allowed: false,
+                exhausted: true,
+            };
+        }
+
+        let delay = PAYOUT_CONFIRMATION_BASE_DELAY_SECONDS.saturating_mul(1u64 << retries_used);
+        let retry_after = last_attempt_at.saturating_add(delay);
+        PayoutConfirmationRetryDecision {
+            retries_used,
+            max_retries: PAYOUT_CONFIRMATION_MAX_RETRIES,
+            retry_after: Some(retry_after),
+            retry_allowed: now >= retry_after,
+            exhausted: false,
+        }
     }
 
     /// Admin-only state transition hook for conformance tests and operations.

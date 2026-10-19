@@ -105,6 +105,31 @@ Each component serves a critical role:
 5. Execution proceeds normally
 ```
 
+## Payout Confirmation Retry Policy
+
+Payout execution is synchronous and atomic on-chain. A delayed transaction
+confirmation must therefore retry the **confirmation check**, not submit the
+payout again. The payroll contract exposes
+`get_payout_confirmation_retry_decision(retries_used, last_attempt_at)` so SDKs
+can apply the same deterministic schedule:
+
+| Confirmation retries already made | Minimum wait before the next check |
+|-----------------------------------:|-----------------------------------:|
+| 0 | 30 seconds |
+| 1 | 60 seconds |
+| 2 | 120 seconds |
+| 3 | 240 seconds |
+| 4 | 480 seconds |
+| 5 or more | Retry limit reached |
+
+The returned `retry_after` is the earliest ledger timestamp for another check;
+`retry_allowed` indicates whether that time has arrived, and `exhausted` marks
+the five-retry limit. `last_attempt_at` must not be later than the current
+ledger timestamp. Clients keep the retry count and last-check timestamp
+alongside their pending transaction record. After the limit, stop automatic
+polling and surface the run ID for operator review. Confirmation retries never
+change the payout payload, nonce, or settlement state.
+
 ## Error Codes and Retry Guidance
 
 | Error | Meaning | Retryable? | SDK Action |
@@ -138,6 +163,7 @@ Each component serves a critical role:
 - [ ] Log execution: `{run_id, nonce, payload_hash, execution_timestamp, total_amount}`
 - [ ] For audit: Store nonce alongside all related records
 - [ ] For reconciliation: Compare returned `total_amount` to expected amount
+- [ ] For delayed confirmation, call `get_payout_confirmation_retry_decision` and retry only the status check; never resubmit a payout to obtain confirmation
 
 ### Idempotency Testing
 
